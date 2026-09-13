@@ -1,9 +1,9 @@
-/system/script
-add name=load_aliases source="{\r\
-    \n:global ql do={/log/print where topics~\"script\"}\r\
-    \n:global gh do={/ip/dhcp-server/lease/print where host-name~\$1}\r\
-    \n:global ipts do={/ip/firewall/nat/print}\r\
-    \n:global ipb do={/ip/route/print}\r\
-    \n}"
+# Policy: read, write, policy, test
 
-## To be scheduled on startup
+:global offline do={
+        /system/script/run go-offline
+    }
+
+    :global route do={
+        /ip/route/print
+    }
