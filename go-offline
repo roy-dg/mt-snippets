@@ -2,6 +2,7 @@
 # Mark the Cloudflare record as offline (sentinel IP), then
 # power off this instance. Run this manually instead of using
 # /system shutdown or the AWS console/CLI directly.
+# Policy: read, write, test
 # ============================================================
 
 # ---- Configurable variables ----
