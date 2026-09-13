@@ -1,0 +1,40 @@
+# ============================================================
+# Mark the Cloudflare record as offline (sentinel IP), then
+# power off this instance. Run this manually instead of using
+# /system shutdown or the AWS console/CLI directly.
+# ============================================================
+
+# ---- Configurable variables ----
+:local cfApiToken    "[token]"
+:local cfZoneId      "[token]"
+:local cfRecordId    "[token]"
+:local sentinelIp  "192.0.2.1"
+:local maxAttempts 3
+:local retryDelay  5s
+# ---------------------------------
+
+:local attempt 0
+:local success false
+
+:while ($attempt < $maxAttempts and $success = false) do={
+  :set attempt ($attempt + 1)
+  :do {
+    :local updateResult [/tool fetch \
+      url="https://api.cloudflare.com/client/v4/zones/$cfZoneId/dns_records/$cfRecordId" \
+      http-method=patch \
+      http-header-field="Content-Type: application/json,Authorization: Bearer $cfApiToken" \
+      http-data="{\"content\":\"$sentinelIp\",\"comment\":\"offline\"}" \
+      check-certificate=yes-without-crl \
+      output=user as-value]
+    :if ([:find ($updateResult->"data") "\"success\":true"] != nil) do={ :set success true }
+  } on-error={}
+  :if ($success = false and $attempt < $maxAttempts) do={ :delay $retryDelay }
+}
+
+:if ($success = true) do={
+  :log info "go-offline: Cloudflare marked offline, shutting down now"
+} else={
+  :log warning "go-offline: could not confirm Cloudflare update after $maxAttempts attempts, shutting down anyway"
+}
+
+/system shutdown
