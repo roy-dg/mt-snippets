@@ -5,6 +5,7 @@
 # Otherwise, make sure the peer is enabled and its endpoint
 # matches the resolved IP. Logs a heartbeat every N runs even
 # when nothing changed, so you can confirm it's still running.
+# # Policy = read, write, policy, test
 # ============================================================
 
 # ---- Configurable variables ----
