@@ -4,6 +4,7 @@
 # retries indefinitely every 30s until internet connectivity
 # (in the form of a successful HTTPS call out) is available.
 # Requires: /system clock set time-zone-name=Asia/Hong_Kong format=yyyy-MM-dd
+# Policy: read, test
 # ============================================================
 
 # ---- Configurable variables ----
