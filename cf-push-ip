@@ -1,0 +1,87 @@
+# ============================================================
+# Push this instance's current public IP + a timestamped comment
+# to a Cloudflare A record. Runs once at RouterOS startup, and
+# retries indefinitely every 30s until internet connectivity
+# (in the form of a successful HTTPS call out) is available.
+# Requires: /system clock set time-zone-name=Asia/Hong_Kong format=yyyy-MM-dd
+# ============================================================
+
+# ---- Configurable variables ----
+:local cfApiToken    "[TOKEN]"
+:local cfZoneId      "[TOKEN]"
+:local cfRecordId    "[TOKEN]"
+:local commentName   "<Name>"
+:local ipCheckUrl       "https://api.ipify.org"
+:local retryDelay       30s
+:local logEveryAttempts 10
+:local clockMaxAttempts 6
+:local clockRetryDelay  5s
+# ---------------------------------
+
+:local attempt 0
+:local sinceLastLog 0
+:local publicIp ""
+
+:log info "cf-push-ip: waiting for internet connectivity"
+
+:while ($publicIp = "") do={
+  :set attempt ($attempt + 1)
+  :do {
+    :local ipResult [/tool fetch url=$ipCheckUrl check-certificate=yes-without-crl output=user as-value]
+    :if (($ipResult->"status") = "finished") do={
+      :set publicIp ($ipResult->"data")
+    }
+  } on-error={}
+
+  :if ($publicIp = "") do={
+    :set sinceLastLog ($sinceLastLog + 1)
+    :if ($sinceLastLog >= $logEveryAttempts) do={
+      :log warning "cf-push-ip: still no internet connectivity after $attempt attempts, retrying every $retryDelay"
+      :set sinceLastLog 0
+    }
+    :delay $retryDelay
+  }
+}
+
+:log info "cf-push-ip: internet is up, public IP is $publicIp (after $attempt attempt(s))"
+
+# Wait for the clock to be NTP-synced before trusting it for the timestamp.
+# Best-effort only: if it never syncs, we still proceed rather than blocking
+# the actual IP update forever over a cosmetic timestamp.
+:local clockAttempt 0
+:local clockOk false
+:while ($clockAttempt < $clockMaxAttempts and $clockOk = false) do={
+  :set clockAttempt ($clockAttempt + 1)
+  :if ([:tonum [:pick [/system clock get date] 0 4]] >= 2024) do={
+    :set clockOk true
+  } else={
+    :delay $clockRetryDelay
+  }
+}
+:if ($clockOk = false) do={
+  :log warning "cf-push-ip: clock still not synced, comment timestamp may be inaccurate"
+}
+
+:local todayDate [/system clock get date]
+:local nowTime   [/system clock get time]
+:local timestamp ([:pick $todayDate 2 4] . "-" . [:pick $todayDate 5 7] . "-" . [:pick $todayDate 8 10] . " " . [:pick $nowTime 0 5])
+:local cfComment ($commentName . " - " . $timestamp)
+
+:log info "cf-push-ip: updating Cloudflare (comment: $cfComment)"
+:do {
+  :local updateResult [/tool fetch \
+    url="https://api.cloudflare.com/client/v4/zones/$cfZoneId/dns_records/$cfRecordId" \
+    http-method=patch \
+    http-header-field="Content-Type: application/json,Authorization: Bearer $cfApiToken" \
+    http-data="{\"content\":\"$publicIp\",\"comment\":\"$cfComment\"}" \
+    check-certificate=yes-without-crl \
+    output=user as-value]
+  :local respBody ($updateResult->"data")
+  :if ([:find $respBody "\"success\":true"] != nil) do={
+    :log info "cf-push-ip: Cloudflare record updated successfully"
+  } else={
+    :log error ("cf-push-ip: Cloudflare update failed, response: " . $respBody)
+  }
+} on-error={
+  :log error "cf-push-ip: HTTP request to Cloudflare API failed"
+}
