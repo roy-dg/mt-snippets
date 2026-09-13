@@ -11,6 +11,7 @@
 :local sentinelIp  "192.0.2.1"
 :local maxAttempts 3
 :local retryDelay  5s
+:local shutdownDelay 10s
 # ---------------------------------
 
 :local attempt 0
@@ -33,8 +34,10 @@
 
 :if ($success = true) do={
   :log info "go-offline: Cloudflare marked offline, shutting down now"
+  :delay $shutdownDelay
 } else={
   :log warning "go-offline: could not confirm Cloudflare update after $maxAttempts attempts, shutting down anyway"
+  :delay $shutdownDelay
 }
 
 /system shutdown
