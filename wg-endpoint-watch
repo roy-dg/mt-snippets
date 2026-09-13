@@ -1,0 +1,71 @@
+# ============================================================
+# Re-resolve [endpoint] every minute. If the resolved IP
+# is the offline sentinel, disable the [peer] (so
+# RouterOS doesn't spam handshake retries while endpoint is off).
+# Otherwise, make sure the peer is enabled and its endpoint
+# matches the resolved IP. Logs a heartbeat every N runs even
+# when nothing changed, so you can confirm it's still running.
+# ============================================================
+
+# ---- Configurable variables ----
+:local peerName       "[peerName]"
+:local endpointFqdn   "[sub-domain]"
+:local sentinelIp     "192.0.2.1"
+:local heartbeatEvery 60
+# ---------------------------------
+
+:global wgWatchRunCount
+:if ([:typeof $wgWatchRunCount] = "nothing") do={ :set wgWatchRunCount 0 }
+
+:do {
+  :local matches [/interface wireguard peers find where name=$peerName]
+
+  :if ([:len $matches] = 0) do={
+    :log error "wg-endpoint-watch: no peer found named '$peerName'"
+  } else={
+    :if ([:len $matches] > 1) do={
+      :log warning "wg-endpoint-watch: multiple peers named '$peerName', skipping to avoid ambiguity"
+    } else={
+      :local peerId ($matches->0)
+      :local resolvedIp [:resolve $endpointFqdn]
+      :local peerIsDisabled [/interface wireguard peers get $peerId disabled]
+      :local changed false
+
+      :if ($resolvedIp = $sentinelIp) do={
+        :if ($peerIsDisabled = false) do={
+          /interface wireguard peers disable $peerId
+          :log info "wg-endpoint-watch: server offline (sentinel seen), '$peerName' disabled"
+          :set changed true
+        }
+      } else={
+        :if ($peerIsDisabled = true) do={
+          /interface wireguard peers enable $peerId
+          :log info "wg-endpoint-watch: server online, '$peerName' re-enabled"
+          :set changed true
+        }
+        :local currentEndpoint [/interface wireguard peers get $peerId endpoint-address]
+        :if ($resolvedIp != $currentEndpoint) do={
+          /interface wireguard peers set $peerId endpoint-address=$resolvedIp
+          :log info "wg-endpoint-watch: '$peerName' endpoint changed $currentEndpoint -> $resolvedIp"
+          :set changed true
+        }
+      }
+
+      :if ($changed = true) do={
+        :set wgWatchRunCount 0
+      } else={
+        :set wgWatchRunCount ($wgWatchRunCount + 1)
+        :if ($wgWatchRunCount >= $heartbeatEvery) do={
+          :if ($resolvedIp = $sentinelIp) do={
+            :log info "wg-endpoint-watch: checked OK, '$peerName' still offline"
+          } else={
+            :log info "wg-endpoint-watch: checked OK, '$peerName' endpoint still $resolvedIp"
+          }
+          :set wgWatchRunCount 0
+        }
+      }
+    }
+  }
+} on-error={
+  :log warning "wg-endpoint-watch: DNS resolution of $endpointFqdn failed, will retry next run"
+}
