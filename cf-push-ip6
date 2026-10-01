@@ -44,6 +44,7 @@
 :local retryDelay       5s
 :local pushMaxAttempts  3
 :local quietEvery       12
+:local heartbeatEvery   12
 :local clockMaxAttempts 6
 :local clockRetryDelay  5s
 :local vaultMaxWait     60
@@ -200,7 +201,9 @@
 # rather than remembered as done.
 :global cfPushIp6Last
 :global cfPushIp6Quiet
+:global cfPushIp6Runs
 :if ([:typeof $cfPushIp6Quiet] != "num") do={ :set cfPushIp6Quiet 0 }
+:if ([:typeof $cfPushIp6Runs] != "num") do={ :set cfPushIp6Runs 0 }
 
 :if ($publicIp6 = "") do={
   # A WAN outage would otherwise log 288 times a day, so complain on the
@@ -217,8 +220,14 @@
   }
 
   :if ($known = $publicIp6) do={
-    # Unchanged. Logging this every 5 minutes would drown the log, so don't.
     :set cfPushIp6Last $publicIp6
+    # Nothing to do, but say so occasionally - as wg-endpoint-watch does -
+    # or a working script and a dead one look identical in the log.
+    :set cfPushIp6Runs ($cfPushIp6Runs + 1)
+    :if ($cfPushIp6Runs >= $heartbeatEvery) do={ :set cfPushIp6Runs 0 }
+    :if ($cfPushIp6Runs = 1) do={
+      :log info ("cf-push-ip6: " . $publicIp6 . " unchanged, no update")
+    }
   } else={
     # Only now is the timestamp worth waiting for: the comment records when
     # the address last changed, and a skipped run writes no comment at all.
@@ -255,6 +264,7 @@
     }
     :if ($pushed = true) do={
       :set cfPushIp6Last $publicIp6
+      :set cfPushIp6Runs 0
     } else={
       :log error "cf-push-ip6: giving up after $attempt failed update attempts, will retry next run"
     }
