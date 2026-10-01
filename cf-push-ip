@@ -1,29 +1,27 @@
 # ============================================================
-# Push this instance's current public IPs + a timestamped comment
-# to a Cloudflare A record, and to a AAAA record for the same
-# subdomain if one is configured. Runs once at RouterOS startup,
-# and retries indefinitely every 30s until internet connectivity
-# (in the form of a successful HTTPS call out) is available.
-# IPv4 gates startup; IPv6 is best-effort and skipped if either
-# the AAAA secret is absent or IPv6 egress is unavailable.
+# Push this instance's public IPv4 (and IPv6, if configured) plus
+# a timestamped comment to Cloudflare A/AAAA records. Runs at
+# startup, retrying every 30s until connectivity is up. IPv4
+# gates startup; IPv6 is skipped if the AAAA secret is absent or
+# IPv6 egress is down. For a v6-only host use cf-push-ip6 instead.
 # Requires: /system clock set time-zone-name=Asia/Hong_Kong format=yyyy-MM-dd
-# Requires: secret-vault run at boot (it defines $SECRET), with
-#           secrets cfpuship-apitoken, cfpuship-zoneid,
-#           cfpuship-recordid, and optionally cfpuship-recordid6
-#           for the AAAA record. Seed them from the terminal with
+# Requires: secret-vault (defines $SECRET) with cfpuship-apitoken,
+#           cfpuship-zoneid, cfpuship-recordid, and optionally
+#           cfpuship-recordid6. Seed with:
 #           $SECRET "set" "<name>" password="..."
 # Policy: read, test, sensitive, policy
-#         "sensitive" is required to read the vault: policy is
-#         enforced per the running script, not per secret-vault.
-#         "policy" is for running secret-vault below; drop it if
-#         your RouterOS version lets /system script run work with
-#         read alone. Requires a script named exactly "secret-vault".
+#         "sensitive" reads the vault; "policy" runs secret-vault.
+# Endpoints: icanhazip is Cloudflare-fronted, so same reachability
+#         class as api.cloudflare.com - api.ipify.org is blocked in
+#         China. Each host is single-family (no AAAA on ipv4.*, no
+#         A on ipv6.*) so the address family is unambiguous.
+#         AAAA-only alternative: ipv6.ip.sb (api.ip.sb is dual stack).
 # ============================================================
 
 # ---- Configurable variables ----
 :local commentName   "<Name>"
-:local ipCheckUrl       "https://api.ipify.org"
-:local ipCheckUrl6      "https://api6.ipify.org"
+:local ipCheckUrl       "https://ipv4.icanhazip.com"
+:local ipCheckUrl6      "https://ipv6.icanhazip.com"
 :local retryDelay       30s
 :local logEveryAttempts 10
 :local clockMaxAttempts 6
@@ -32,26 +30,19 @@
 :local startupDelay     5s
 # ---------------------------------
 
-# Scheduler entries with start-time=startup fire before RouterOS has finished
-# bringing the system up, so pause briefly before touching anything. Kept
-# short deliberately: the two things that actually used to fail here are now
-# handled properly - the vault is run directly below rather than waited on,
-# and the connectivity loop retries forever - so this is a courtesy pause,
-# not the mechanism anything depends on.
+# start-time=startup fires before RouterOS is fully up, so pause briefly.
+# A courtesy pause only: the vault is run directly below rather than waited
+# on, and the connectivity loop retries forever.
 :delay $startupDelay
 
-# At startup this script and secret-vault's own scheduler entry race, so
-# waiting for $SECRET to exist is required, not cosmetic. $SECRET lives in
-# the script environment and is cleared by a reboot; the secrets themselves
-# persist in /ppp/secret. vaultMaxWait is in 500ms units, so 60 = 30s.
+# $SECRET lives in the script environment and is cleared by a reboot; the
+# secrets themselves persist in /ppp/secret. vaultMaxWait is in 500ms units.
 :global SecretVaultReady
 :global SECRET
 
-# If the vault isn't up yet, define it ourselves rather than hoping its own
-# scheduler entry has already fired. A no-op when it is up, so this is safe
-# to do unconditionally-ish, and it turns the startup ordering from probable
-# into deterministic. The wait loop below is kept as a fallback, for the case
-# where secret-vault is already mid-execution from its own entry.
+# Run the vault ourselves rather than hoping its own scheduler entry has
+# already fired - a no-op if it has. The wait loop below is the fallback for
+# when secret-vault is already mid-execution from that entry.
 :if ($SecretVaultReady != true) do={
   :do { /system script run secret-vault } on-error={
     :log warning "cf-push-ip: could not run secret-vault directly, falling back to waiting for it"
@@ -68,9 +59,8 @@
   :error "cf-push-ip: secret-vault not ready"
 }
 
-# Credentials come from the vault, never from this script's text. $SECRET
-# "get" raises on an unknown name, so each read is wrapped and an empty
-# result is treated the same as a missing one - both mean "unusable".
+# $SECRET "get" raises on an unknown name, so each read is wrapped; an empty
+# result means the same as a missing one.
 :local cfApiToken ""
 :local cfZoneId   ""
 :local cfRecordId ""
@@ -87,8 +77,7 @@
   :error "cf-push-ip: incomplete secrets"
 }
 
-# cfpuship-recordid6 is deliberately optional: without it this stays a
-# pure IPv4 updater, which is what v4-only hosts want.
+# Optional: without it this stays a pure IPv4 updater.
 :local cfRecordId6 ""
 :do { :set cfRecordId6 [$SECRET "get" "cfpuship-recordid6"] } on-error={}
 :local doIpv6 true
@@ -97,8 +86,18 @@
   :log info "cf-push-ip: no cfpuship-recordid6 secret, IPv6 record will not be updated"
 }
 
-# PATCH one DNS record. RouterOS do={} functions do not capture outer
-# :local variables, so everything it needs is passed in explicitly.
+# The endpoint returns the address with a trailing newline, which would end
+# up inside the JSON body and be rejected, so strip anything non-address.
+:local trimIp do={
+  :local out ""
+  :for i from=0 to=([:len $raw] - 1) do={
+    :local c [:pick $raw $i]
+    :if ($c != "\n" && $c != "\r" && $c != " " && $c != "\t") do={ :set out ($out . $c) }
+  }
+  :return $out
+}
+
+# PATCH one DNS record. do={} functions see no outer :local, so pass it all in.
 :local pushRecord do={
   :do {
     :local updateResult [/tool fetch \
@@ -130,7 +129,7 @@
   :do {
     :local ipResult [/tool fetch url=$ipCheckUrl check-certificate=yes-without-crl output=user as-value]
     :if (($ipResult->"status") = "finished") do={
-      :set publicIp ($ipResult->"data")
+      :set publicIp [$trimIp raw=($ipResult->"data")]
     }
   } on-error={}
 
@@ -146,16 +145,14 @@
 
 :log info "cf-push-ip: internet is up, public IPv4 is $publicIp (after $attempt attempt(s))"
 
-# Fetch the public IPv6 once, over a v6-only host so the address family is
-# unambiguous. Best-effort only: a failure here means IPv6 egress is not
-# working, in which case publishing an AAAA record would point the subdomain
-# at an unreachable address, so we skip it rather than block the A update.
+# Best-effort: no IPv6 egress means an AAAA record would point at an
+# unreachable address, so skip it rather than block the A update.
 :local publicIp6 ""
 :if ($doIpv6 = true) do={
   :do {
     :local ip6Result [/tool fetch url=$ipCheckUrl6 check-certificate=yes-without-crl output=user as-value]
     :if (($ip6Result->"status") = "finished") do={
-      :set publicIp6 ($ip6Result->"data")
+      :set publicIp6 [$trimIp raw=($ip6Result->"data")]
     }
   } on-error={}
   :if ($publicIp6 = "") do={
@@ -165,9 +162,8 @@
   }
 }
 
-# Wait for the clock to be NTP-synced before trusting it for the timestamp.
-# Best-effort only: if it never syncs, we still proceed rather than blocking
-# the actual IP update forever over a cosmetic timestamp.
+# Best-effort: if the clock never syncs we still proceed rather than block
+# the IP update over a cosmetic timestamp.
 :local clockAttempt 0
 :local clockOk false
 :while ($clockAttempt < $clockMaxAttempts and $clockOk = false) do={

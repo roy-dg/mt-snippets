@@ -1,0 +1,163 @@
+# ============================================================
+# IPv6-only variant of cf-push-ip: pushes this instance's public
+# IPv6 plus a timestamped comment to a Cloudflare AAAA record.
+# Runs at startup, retrying every 30s until IPv6 egress is up -
+# here IPv6 is the point, not best-effort. Run this *instead of*
+# cf-push-ip; running both makes two scripts fight over the AAAA
+# record.
+# Requires: /system clock set time-zone-name=Asia/Hong_Kong format=yyyy-MM-dd
+# Requires: secret-vault (defines $SECRET) with cfpuship-apitoken,
+#           cfpuship-zoneid and cfpuship-recordid6. The first two
+#           are shared with cf-push-ip. Seed with:
+#           $SECRET "set" "<name>" password="..."
+# Policy: read, test, sensitive, policy
+#         "sensitive" reads the vault; "policy" runs secret-vault.
+# Endpoint: ipv6.icanhazip.com is AAAA-only, so the answer cannot
+#         arrive over IPv4, and Cloudflare-fronted, so it is the
+#         same reachability class as api.cloudflare.com -
+#         api6.ipify.org is blocked in China. AAAA-only
+#         alternative: ipv6.ip.sb (api.ip.sb is dual stack).
+# ============================================================
+
+# ---- Configurable variables ----
+:local commentName   "<Name>"
+:local ipCheckUrl6   "https://ipv6.icanhazip.com"
+:local retryDelay       30s
+:local logEveryAttempts 10
+:local clockMaxAttempts 6
+:local clockRetryDelay  5s
+:local vaultMaxWait     60
+:local startupDelay     5s
+# ---------------------------------
+
+# start-time=startup fires before RouterOS is fully up, so pause briefly.
+# A courtesy pause only: the vault is run directly below rather than waited
+# on, and the connectivity loop retries forever.
+:delay $startupDelay
+
+# $SECRET lives in the script environment and is cleared by a reboot; the
+# secrets themselves persist in /ppp/secret. vaultMaxWait is in 500ms units.
+:global SecretVaultReady
+:global SECRET
+
+# Run the vault ourselves rather than hoping its own scheduler entry has
+# already fired - a no-op if it has. The wait loop below is the fallback for
+# when secret-vault is already mid-execution from that entry.
+:if ($SecretVaultReady != true) do={
+  :do { /system script run secret-vault } on-error={
+    :log warning "cf-push-ip6: could not run secret-vault directly, falling back to waiting for it"
+  }
+}
+
+:local waited 0
+:while ($SecretVaultReady != true && $waited < $vaultMaxWait) do={
+  :delay 500ms
+  :set waited ($waited + 1)
+}
+:if ($SecretVaultReady != true) do={
+  :log error "cf-push-ip6: secret-vault not ready, cannot read credentials - aborting"
+  :error "cf-push-ip6: secret-vault not ready"
+}
+
+# $SECRET "get" raises on an unknown name, so each read is wrapped; an empty
+# result means the same as a missing one.
+:local cfApiToken  ""
+:local cfZoneId    ""
+:local cfRecordId6 ""
+:do { :set cfApiToken  [$SECRET "get" "cfpuship-apitoken"] } on-error={}
+:do { :set cfZoneId    [$SECRET "get" "cfpuship-zoneid"] } on-error={}
+:do { :set cfRecordId6 [$SECRET "get" "cfpuship-recordid6"] } on-error={}
+
+# Unlike in cf-push-ip, a missing cfpuship-recordid6 is fatal here.
+:local missing ""
+:if ($cfApiToken  = "") do={ :set missing ($missing . " cfpuship-apitoken") }
+:if ($cfZoneId    = "") do={ :set missing ($missing . " cfpuship-zoneid") }
+:if ($cfRecordId6 = "") do={ :set missing ($missing . " cfpuship-recordid6") }
+:if ($missing != "") do={
+  :log error ("cf-push-ip6: missing secret(s):" . $missing . " - aborting")
+  :error "cf-push-ip6: incomplete secrets"
+}
+
+# The endpoint returns the address with a trailing newline, which would end
+# up inside the JSON body and be rejected, so strip anything non-address.
+:local trimIp do={
+  :local out ""
+  :for i from=0 to=([:len $raw] - 1) do={
+    :local c [:pick $raw $i]
+    :if ($c != "\n" && $c != "\r" && $c != " " && $c != "\t") do={ :set out ($out . $c) }
+  }
+  :return $out
+}
+
+# PATCH one DNS record. do={} functions see no outer :local, so pass it all in.
+:local pushRecord do={
+  :do {
+    :local updateResult [/tool fetch \
+      url="https://api.cloudflare.com/client/v4/zones/$zone/dns_records/$record" \
+      http-method=patch \
+      http-header-field="Content-Type: application/json,Authorization: Bearer $token" \
+      http-data="{\"content\":\"$ip\",\"comment\":\"$comment\"}" \
+      check-certificate=yes-without-crl \
+      output=user as-value]
+    :local respBody ($updateResult->"data")
+    :if ([:find $respBody "\"success\":true"] != nil) do={
+      :log info ("cf-push-ip6: " . $label . " record updated successfully -> " . $ip)
+    } else={
+      :log error ("cf-push-ip6: " . $label . " update failed, response: " . $respBody)
+    }
+  } on-error={
+    :log error ("cf-push-ip6: HTTP request to Cloudflare API failed for " . $label . " record")
+  }
+}
+
+:local attempt 0
+:local sinceLastLog 0
+:local publicIp6 ""
+
+:log info "cf-push-ip6: waiting for IPv6 connectivity"
+
+:while ($publicIp6 = "") do={
+  :set attempt ($attempt + 1)
+  :do {
+    :local ip6Result [/tool fetch url=$ipCheckUrl6 check-certificate=yes-without-crl output=user as-value]
+    :if (($ip6Result->"status") = "finished") do={
+      :set publicIp6 [$trimIp raw=($ip6Result->"data")]
+    }
+  } on-error={}
+
+  :if ($publicIp6 = "") do={
+    :set sinceLastLog ($sinceLastLog + 1)
+    :if ($sinceLastLog >= $logEveryAttempts) do={
+      :log warning "cf-push-ip6: still no IPv6 connectivity after $attempt attempts, retrying every $retryDelay"
+      :set sinceLastLog 0
+    }
+    :delay $retryDelay
+  }
+}
+
+:log info "cf-push-ip6: IPv6 is up, public IPv6 is $publicIp6 (after $attempt attempt(s))"
+
+# Best-effort: if the clock never syncs we still proceed rather than block
+# the IP update over a cosmetic timestamp.
+:local clockAttempt 0
+:local clockOk false
+:while ($clockAttempt < $clockMaxAttempts and $clockOk = false) do={
+  :set clockAttempt ($clockAttempt + 1)
+  :if ([:tonum [:pick [/system clock get date] 0 4]] >= 2024) do={
+    :set clockOk true
+  } else={
+    :delay $clockRetryDelay
+  }
+}
+:if ($clockOk = false) do={
+  :log warning "cf-push-ip6: clock still not synced, comment timestamp may be inaccurate"
+}
+
+:local todayDate [/system clock get date]
+:local nowTime   [/system clock get time]
+:local timestamp ([:pick $todayDate 2 4] . "-" . [:pick $todayDate 5 7] . "-" . [:pick $todayDate 8 10] . " " . [:pick $nowTime 0 5])
+:local cfComment ($commentName . " - " . $timestamp)
+
+:log info "cf-push-ip6: updating Cloudflare (comment: $cfComment)"
+
+$pushRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId6 ip=$publicIp6 comment=$cfComment label="AAAA"
