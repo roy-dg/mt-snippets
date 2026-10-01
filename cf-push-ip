@@ -5,23 +5,19 @@
 # and retries indefinitely every 30s until internet connectivity
 # (in the form of a successful HTTPS call out) is available.
 # IPv4 gates startup; IPv6 is best-effort and skipped if either
-# the AAAA record id is unset or IPv6 egress is unavailable.
+# the AAAA secret is absent or IPv6 egress is unavailable.
 # Requires: /system clock set time-zone-name=Asia/Hong_Kong format=yyyy-MM-dd
-# Requires: :global SECRETS set with keys cfpuship-apitoken,
-#           cfpuship-zoneid, cfpuship-recordid, and optionally
-#           cfpuship-recordid6 for the AAAA record (keys are prefixed per
-#           script so several scripts can hold their own Cloudflare
-#           credentials in the one global). $SECRETS must be populated
-#           under the same user that runs this script.
-# Policy: read, test
+# Requires: secret-vault run at boot (it defines $SECRET), with
+#           secrets cfpuship-apitoken, cfpuship-zoneid,
+#           cfpuship-recordid, and optionally cfpuship-recordid6
+#           for the AAAA record. Seed them from the terminal with
+#           $SECRET "set" "<name>" password="..."
+# Policy: read, test, sensitive
+#         "sensitive" is required to read the vault: policy is
+#         enforced per the running script, not per secret-vault.
 # ============================================================
 
 # ---- Configurable variables ----
-:global SECRETS
-:local cfApiToken    ($SECRETS->"cfpuship-apitoken")
-:local cfZoneId      ($SECRETS->"cfpuship-zoneid")
-:local cfRecordId    ($SECRETS->"cfpuship-recordid")
-:local cfRecordId6   ($SECRETS->"cfpuship-recordid6")
 :local commentName   "<Name>"
 :local ipCheckUrl       "https://api.ipify.org"
 :local ipCheckUrl6      "https://api6.ipify.org"
@@ -29,25 +25,52 @@
 :local logEveryAttempts 10
 :local clockMaxAttempts 6
 :local clockRetryDelay  5s
+:local vaultMaxWait     20
 # ---------------------------------
 
-# Fail fast rather than firing a request with an empty token or zone/record id,
-# which can happen if this runs before $SECRETS has been populated.
+# At startup this script and secret-vault's own scheduler entry race, so
+# waiting for $SECRET to exist is required, not cosmetic. $SECRET lives in
+# the script environment and is cleared by a reboot; the secrets themselves
+# persist in /ppp/secret.
+:global SecretVaultReady
+:global SECRET
+:local waited 0
+:while ($SecretVaultReady != true && $waited < $vaultMaxWait) do={
+  :delay 500ms
+  :set waited ($waited + 1)
+}
+:if ($SecretVaultReady != true) do={
+  :log error "cf-push-ip: secret-vault not ready, cannot read credentials - aborting"
+  :error "cf-push-ip: secret-vault not ready"
+}
+
+# Credentials come from the vault, never from this script's text. $SECRET
+# "get" raises on an unknown name, so each read is wrapped and an empty
+# result is treated the same as a missing one - both mean "unusable".
+:local cfApiToken ""
+:local cfZoneId   ""
+:local cfRecordId ""
+:do { :set cfApiToken [$SECRET "get" "cfpuship-apitoken"] } on-error={}
+:do { :set cfZoneId   [$SECRET "get" "cfpuship-zoneid"] } on-error={}
+:do { :set cfRecordId [$SECRET "get" "cfpuship-recordid"] } on-error={}
+
 :local missing ""
-:if ([:typeof $cfApiToken] = "nothing" or $cfApiToken = "") do={ :set missing ($missing . " cfpuship-apitoken") }
-:if ([:typeof $cfZoneId]   = "nothing" or $cfZoneId   = "") do={ :set missing ($missing . " cfpuship-zoneid") }
-:if ([:typeof $cfRecordId] = "nothing" or $cfRecordId = "") do={ :set missing ($missing . " cfpuship-recordid") }
+:if ($cfApiToken = "") do={ :set missing ($missing . " cfpuship-apitoken") }
+:if ($cfZoneId   = "") do={ :set missing ($missing . " cfpuship-zoneid") }
+:if ($cfRecordId = "") do={ :set missing ($missing . " cfpuship-recordid") }
 :if ($missing != "") do={
-  :log error ("cf-push-ip: missing \$SECRETS key(s):" . $missing . " - aborting")
-  :error "cf-push-ip: incomplete \$SECRETS"
+  :log error ("cf-push-ip: missing secret(s):" . $missing . " - aborting")
+  :error "cf-push-ip: incomplete secrets"
 }
 
 # cfpuship-recordid6 is deliberately optional: without it this stays a
 # pure IPv4 updater, which is what v4-only hosts want.
+:local cfRecordId6 ""
+:do { :set cfRecordId6 [$SECRET "get" "cfpuship-recordid6"] } on-error={}
 :local doIpv6 true
-:if ([:typeof $cfRecordId6] = "nothing" or $cfRecordId6 = "") do={
+:if ($cfRecordId6 = "") do={
   :set doIpv6 false
-  :log info "cf-push-ip: no cfpuship-recordid6 set, IPv6 record will not be updated"
+  :log info "cf-push-ip: no cfpuship-recordid6 secret, IPv6 record will not be updated"
 }
 
 # PATCH one DNS record. RouterOS do={} functions do not capture outer

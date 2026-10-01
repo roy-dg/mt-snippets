@@ -2,49 +2,72 @@
 # Mark the Cloudflare records as offline (sentinel IPs), then
 # power off this instance. Run this manually instead of using
 # /system shutdown or the AWS console/CLI directly.
-# Sentinels both the A record and, if an AAAA record id is
+# Sentinels both the A record and, if an AAAA secret is
 # configured, the AAAA record for the same subdomain - otherwise
 # a v6-preferring resolver would still get a live-looking answer
 # for a host that has shut down.
-# Requires: :global SECRETS set with keys gooffline-apitoken,
-#           gooffline-zoneid, gooffline-recordid, and optionally
-#           gooffline-recordid6 for the AAAA record (keys are
-#           prefixed per script so several scripts can hold their
-#           own Cloudflare credentials in the one global).
-#           $SECRETS must be populated under the same user that
-#           runs this script.
-# Policy: read, write, test
+# Every failure path still shuts down: this is the shutdown
+# command, so it must not become a no-op because DNS or the
+# secret vault misbehaved.
+# Requires: secret-vault run at boot (it defines $SECRET), with
+#           secrets gooffline-apitoken, gooffline-zoneid,
+#           gooffline-recordid, and optionally gooffline-recordid6
+#           for the AAAA record. Seed them from the terminal with
+#           $SECRET "set" "<name>" password="..."
+# Policy: read, write, test, sensitive
+#         "sensitive" is required to read the vault: policy is
+#         enforced per the running script, not per secret-vault.
 # ============================================================
 
 # ---- Configurable variables ----
-:global SECRETS
-:local cfApiToken    ($SECRETS->"gooffline-apitoken")
-:local cfZoneId      ($SECRETS->"gooffline-zoneid")
-:local cfRecordId    ($SECRETS->"gooffline-recordid")
-:local cfRecordId6   ($SECRETS->"gooffline-recordid6")
 :local sentinelIp  "192.0.2.1"
 :local sentinelIp6 "100::1"
 :local maxAttempts 3
 :local retryDelay  5s
 :local shutdownDelay 10s
+:local vaultMaxWait  20
 # ---------------------------------
 
-# Don't fire a request with an empty token or zone/record id, which can happen
-# if $SECRETS has not been populated. Note this only skips the Cloudflare
-# update: the shutdown below still happens, matching this script's existing
-# behaviour of powering off even when the record could not be confirmed.
+# Wait for secret-vault to define $SECRET. Unlike cf-push-ip this must not
+# :error out if the vault never appears - that would skip the shutdown below,
+# silently turning this command into a no-op. Log and carry on instead.
+:global SecretVaultReady
+:global SECRET
+:local waited 0
+:while ($SecretVaultReady != true && $waited < $vaultMaxWait) do={
+  :delay 500ms
+  :set waited ($waited + 1)
+}
+
 :local missing ""
-:if ([:typeof $cfApiToken] = "nothing" or $cfApiToken = "") do={ :set missing ($missing . " gooffline-apitoken") }
-:if ([:typeof $cfZoneId]   = "nothing" or $cfZoneId   = "") do={ :set missing ($missing . " gooffline-zoneid") }
-:if ([:typeof $cfRecordId] = "nothing" or $cfRecordId = "") do={ :set missing ($missing . " gooffline-recordid") }
-:if ($missing != "") do={
-  :log error ("go-offline: missing \$SECRETS key(s):" . $missing . " - skipping Cloudflare update")
+:local cfApiToken  ""
+:local cfZoneId    ""
+:local cfRecordId  ""
+:local cfRecordId6 ""
+
+:if ($SecretVaultReady != true) do={
+  :set missing " (secret-vault not ready)"
+  :log error "go-offline: secret-vault not ready, skipping Cloudflare update"
+} else={
+  # $SECRET "get" raises on an unknown name, so each read is wrapped and an
+  # empty result is treated the same as a missing one - both mean "unusable".
+  :do { :set cfApiToken  [$SECRET "get" "gooffline-apitoken"] } on-error={}
+  :do { :set cfZoneId    [$SECRET "get" "gooffline-zoneid"] } on-error={}
+  :do { :set cfRecordId  [$SECRET "get" "gooffline-recordid"] } on-error={}
+  :do { :set cfRecordId6 [$SECRET "get" "gooffline-recordid6"] } on-error={}
+
+  :if ($cfApiToken = "") do={ :set missing ($missing . " gooffline-apitoken") }
+  :if ($cfZoneId   = "") do={ :set missing ($missing . " gooffline-zoneid") }
+  :if ($cfRecordId = "") do={ :set missing ($missing . " gooffline-recordid") }
+  :if ($missing != "") do={
+    :log error ("go-offline: missing secret(s):" . $missing . " - skipping Cloudflare update")
+  }
 }
 
 # gooffline-recordid6 is deliberately optional, mirroring cf-push-ip: without
 # it this stays a pure IPv4 updater, which is what v4-only hosts want.
 :local doIpv6 true
-:if ([:typeof $cfRecordId6] = "nothing" or $cfRecordId6 = "") do={
+:if ($cfRecordId6 = "") do={
   :set doIpv6 false
 }
 
