@@ -25,13 +25,23 @@
 :local logEveryAttempts 10
 :local clockMaxAttempts 6
 :local clockRetryDelay  5s
-:local vaultMaxWait     20
+:local vaultMaxWait     60
+:local startupDelay     30s
 # ---------------------------------
+
+# Scheduler entries with start-time=startup fire before RouterOS has finished
+# bringing the system up. Hold off before touching anything, so the first
+# fetch and the first vault read are not made against a half-initialised
+# router. This is a deliberate fixed delay, not a readiness check: it costs
+# 30s on every boot regardless of how fast the router actually came up.
+:delay $startupDelay
 
 # At startup this script and secret-vault's own scheduler entry race, so
 # waiting for $SECRET to exist is required, not cosmetic. $SECRET lives in
 # the script environment and is cleared by a reboot; the secrets themselves
-# persist in /ppp/secret.
+# persist in /ppp/secret. vaultMaxWait is in 500ms units, so 60 = 30s - the
+# startup delay above does not guarantee secret-vault has run yet, only that
+# it has had a chance to.
 :global SecretVaultReady
 :global SECRET
 :local waited 0
