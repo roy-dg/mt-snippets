@@ -2,23 +2,41 @@
 # Mark the Cloudflare record as offline (sentinel IP), then
 # power off this instance. Run this manually instead of using
 # /system shutdown or the AWS console/CLI directly.
+# Requires: :global SECRETS set with keys gooffline-apitoken,
+#           gooffline-zoneid, gooffline-recordid (keys are prefixed per
+#           script so several scripts can hold their own Cloudflare
+#           credentials in the one global). $SECRETS must be populated
+#           under the same user that runs this script.
 # Policy: read, write, test
 # ============================================================
 
 # ---- Configurable variables ----
-:local cfApiToken    "[token]"
-:local cfZoneId      "[token]"
-:local cfRecordId    "[token]"
+:global SECRETS
+:local cfApiToken    ($SECRETS->"gooffline-apitoken")
+:local cfZoneId      ($SECRETS->"gooffline-zoneid")
+:local cfRecordId    ($SECRETS->"gooffline-recordid")
 :local sentinelIp  "192.0.2.1"
 :local maxAttempts 3
 :local retryDelay  5s
 :local shutdownDelay 10s
 # ---------------------------------
 
+# Don't fire a request with an empty token or zone/record id, which can happen
+# if $SECRETS has not been populated. Note this only skips the Cloudflare
+# update: the shutdown below still happens, matching this script's existing
+# behaviour of powering off even when the record could not be confirmed.
+:local missing ""
+:if ([:typeof $cfApiToken] = "nothing" or $cfApiToken = "") do={ :set missing ($missing . " gooffline-apitoken") }
+:if ([:typeof $cfZoneId]   = "nothing" or $cfZoneId   = "") do={ :set missing ($missing . " gooffline-zoneid") }
+:if ([:typeof $cfRecordId] = "nothing" or $cfRecordId = "") do={ :set missing ($missing . " gooffline-recordid") }
+:if ($missing != "") do={
+  :log error ("go-offline: missing \$SECRETS key(s):" . $missing . " - skipping Cloudflare update")
+}
+
 :local attempt 0
 :local success false
 
-:while ($attempt < $maxAttempts and $success = false) do={
+:while ($missing = "" and $attempt < $maxAttempts and $success = false) do={
   :set attempt ($attempt + 1)
   :do {
     :local updateResult [/tool fetch \
@@ -37,7 +55,7 @@
   :log info "go-offline: Cloudflare marked offline, shutting down now"
   :delay $shutdownDelay
 } else={
-  :log warning "go-offline: could not confirm Cloudflare update after $maxAttempts attempts, shutting down anyway"
+  :log warning "go-offline: could not confirm Cloudflare update after $attempt attempt(s), shutting down anyway"
   :delay $shutdownDelay
 }
 

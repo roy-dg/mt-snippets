@@ -4,13 +4,19 @@
 # retries indefinitely every 30s until internet connectivity
 # (in the form of a successful HTTPS call out) is available.
 # Requires: /system clock set time-zone-name=Asia/Hong_Kong format=yyyy-MM-dd
+# Requires: :global SECRETS set with keys cfpuship-apitoken,
+#           cfpuship-zoneid, cfpuship-recordid (keys are prefixed per
+#           script so several scripts can hold their own Cloudflare
+#           credentials in the one global). $SECRETS must be populated
+#           under the same user that runs this script.
 # Policy: read, test
 # ============================================================
 
 # ---- Configurable variables ----
-:local cfApiToken    "[TOKEN]"
-:local cfZoneId      "[TOKEN]"
-:local cfRecordId    "[TOKEN]"
+:global SECRETS
+:local cfApiToken    ($SECRETS->"cfpuship-apitoken")
+:local cfZoneId      ($SECRETS->"cfpuship-zoneid")
+:local cfRecordId    ($SECRETS->"cfpuship-recordid")
 :local commentName   "<Name>"
 :local ipCheckUrl       "https://api.ipify.org"
 :local retryDelay       30s
@@ -18,6 +24,17 @@
 :local clockMaxAttempts 6
 :local clockRetryDelay  5s
 # ---------------------------------
+
+# Fail fast rather than firing a request with an empty token or zone/record id,
+# which can happen if this runs before $SECRETS has been populated.
+:local missing ""
+:if ([:typeof $cfApiToken] = "nothing" or $cfApiToken = "") do={ :set missing ($missing . " cfpuship-apitoken") }
+:if ([:typeof $cfZoneId]   = "nothing" or $cfZoneId   = "") do={ :set missing ($missing . " cfpuship-zoneid") }
+:if ([:typeof $cfRecordId] = "nothing" or $cfRecordId = "") do={ :set missing ($missing . " cfpuship-recordid") }
+:if ($missing != "") do={
+  :log error ("cf-push-ip: missing \$SECRETS key(s):" . $missing . " - aborting")
+  :error "cf-push-ip: incomplete \$SECRETS"
+}
 
 :local attempt 0
 :local sinceLastLog 0
