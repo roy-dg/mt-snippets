@@ -1,12 +1,18 @@
 # ============================================================
-# Mark the Cloudflare record as offline (sentinel IP), then
+# Mark the Cloudflare records as offline (sentinel IPs), then
 # power off this instance. Run this manually instead of using
 # /system shutdown or the AWS console/CLI directly.
+# Sentinels both the A record and, if an AAAA record id is
+# configured, the AAAA record for the same subdomain - otherwise
+# a v6-preferring resolver would still get a live-looking answer
+# for a host that has shut down.
 # Requires: :global SECRETS set with keys gooffline-apitoken,
-#           gooffline-zoneid, gooffline-recordid (keys are prefixed per
-#           script so several scripts can hold their own Cloudflare
-#           credentials in the one global). $SECRETS must be populated
-#           under the same user that runs this script.
+#           gooffline-zoneid, gooffline-recordid, and optionally
+#           gooffline-recordid6 for the AAAA record (keys are
+#           prefixed per script so several scripts can hold their
+#           own Cloudflare credentials in the one global).
+#           $SECRETS must be populated under the same user that
+#           runs this script.
 # Policy: read, write, test
 # ============================================================
 
@@ -15,7 +21,9 @@
 :local cfApiToken    ($SECRETS->"gooffline-apitoken")
 :local cfZoneId      ($SECRETS->"gooffline-zoneid")
 :local cfRecordId    ($SECRETS->"gooffline-recordid")
+:local cfRecordId6   ($SECRETS->"gooffline-recordid6")
 :local sentinelIp  "192.0.2.1"
+:local sentinelIp6 "100::1"
 :local maxAttempts 3
 :local retryDelay  5s
 :local shutdownDelay 10s
@@ -33,30 +41,50 @@
   :log error ("go-offline: missing \$SECRETS key(s):" . $missing . " - skipping Cloudflare update")
 }
 
-:local attempt 0
-:local success false
-
-:while ($missing = "" and $attempt < $maxAttempts and $success = false) do={
-  :set attempt ($attempt + 1)
-  :do {
-    :local updateResult [/tool fetch \
-      url="https://api.cloudflare.com/client/v4/zones/$cfZoneId/dns_records/$cfRecordId" \
-      http-method=patch \
-      http-header-field="Content-Type: application/json,Authorization: Bearer $cfApiToken" \
-      http-data="{\"content\":\"$sentinelIp\",\"comment\":\"offline\"}" \
-      check-certificate=yes-without-crl \
-      output=user as-value]
-    :if ([:find ($updateResult->"data") "\"success\":true"] != nil) do={ :set success true }
-  } on-error={}
-  :if ($success = false and $attempt < $maxAttempts) do={ :delay $retryDelay }
+# gooffline-recordid6 is deliberately optional, mirroring cf-push-ip: without
+# it this stays a pure IPv4 updater, which is what v4-only hosts want.
+:local doIpv6 true
+:if ([:typeof $cfRecordId6] = "nothing" or $cfRecordId6 = "") do={
+  :set doIpv6 false
 }
 
-:if ($success = true) do={
-  :log info "go-offline: Cloudflare marked offline, shutting down now"
-  :delay $shutdownDelay
-} else={
-  :log warning "go-offline: could not confirm Cloudflare update after $attempt attempt(s), shutting down anyway"
-  :delay $shutdownDelay
+# PATCH one DNS record to its sentinel, retrying up to maxAttempts. RouterOS
+# do={} functions do not capture outer :local variables, so everything it
+# needs is passed in explicitly.
+:local pushSentinel do={
+  :local attempt 0
+  :local success false
+  :while ($attempt < $maxAttempts and $success = false) do={
+    :set attempt ($attempt + 1)
+    :do {
+      :local updateResult [/tool fetch \
+        url="https://api.cloudflare.com/client/v4/zones/$zone/dns_records/$record" \
+        http-method=patch \
+        http-header-field="Content-Type: application/json,Authorization: Bearer $token" \
+        http-data="{\"content\":\"$ip\",\"comment\":\"offline\"}" \
+        check-certificate=yes-without-crl \
+        output=user as-value]
+      :if ([:find ($updateResult->"data") "\"success\":true"] != nil) do={ :set success true }
+    } on-error={}
+    :if ($success = false and $attempt < $maxAttempts) do={ :delay $retryDelay }
+  }
+  :if ($success = true) do={
+    :log info ("go-offline: " . $label . " record marked offline -> " . $ip)
+  } else={
+    :log warning ("go-offline: could not confirm " . $label . " update after " . $attempt . " attempt(s)")
+  }
 }
+
+:if ($missing = "") do={
+  $pushSentinel token=$cfApiToken zone=$cfZoneId record=$cfRecordId ip=$sentinelIp label="A" \
+    maxAttempts=$maxAttempts retryDelay=$retryDelay
+  :if ($doIpv6 = true) do={
+    $pushSentinel token=$cfApiToken zone=$cfZoneId record=$cfRecordId6 ip=$sentinelIp6 label="AAAA" \
+      maxAttempts=$maxAttempts retryDelay=$retryDelay
+  }
+}
+
+:log info "go-offline: shutting down now"
+:delay $shutdownDelay
 
 /system shutdown

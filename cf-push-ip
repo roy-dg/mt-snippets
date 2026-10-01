@@ -1,11 +1,15 @@
 # ============================================================
-# Push this instance's current public IP + a timestamped comment
-# to a Cloudflare A record. Runs once at RouterOS startup, and
-# retries indefinitely every 30s until internet connectivity
+# Push this instance's current public IPs + a timestamped comment
+# to a Cloudflare A record, and to a AAAA record for the same
+# subdomain if one is configured. Runs once at RouterOS startup,
+# and retries indefinitely every 30s until internet connectivity
 # (in the form of a successful HTTPS call out) is available.
+# IPv4 gates startup; IPv6 is best-effort and skipped if either
+# the AAAA record id is unset or IPv6 egress is unavailable.
 # Requires: /system clock set time-zone-name=Asia/Hong_Kong format=yyyy-MM-dd
 # Requires: :global SECRETS set with keys cfpuship-apitoken,
-#           cfpuship-zoneid, cfpuship-recordid (keys are prefixed per
+#           cfpuship-zoneid, cfpuship-recordid, and optionally
+#           cfpuship-recordid6 for the AAAA record (keys are prefixed per
 #           script so several scripts can hold their own Cloudflare
 #           credentials in the one global). $SECRETS must be populated
 #           under the same user that runs this script.
@@ -17,8 +21,10 @@
 :local cfApiToken    ($SECRETS->"cfpuship-apitoken")
 :local cfZoneId      ($SECRETS->"cfpuship-zoneid")
 :local cfRecordId    ($SECRETS->"cfpuship-recordid")
+:local cfRecordId6   ($SECRETS->"cfpuship-recordid6")
 :local commentName   "<Name>"
 :local ipCheckUrl       "https://api.ipify.org"
+:local ipCheckUrl6      "https://api6.ipify.org"
 :local retryDelay       30s
 :local logEveryAttempts 10
 :local clockMaxAttempts 6
@@ -34,6 +40,36 @@
 :if ($missing != "") do={
   :log error ("cf-push-ip: missing \$SECRETS key(s):" . $missing . " - aborting")
   :error "cf-push-ip: incomplete \$SECRETS"
+}
+
+# cfpuship-recordid6 is deliberately optional: without it this stays a
+# pure IPv4 updater, which is what v4-only hosts want.
+:local doIpv6 true
+:if ([:typeof $cfRecordId6] = "nothing" or $cfRecordId6 = "") do={
+  :set doIpv6 false
+  :log info "cf-push-ip: no cfpuship-recordid6 set, IPv6 record will not be updated"
+}
+
+# PATCH one DNS record. RouterOS do={} functions do not capture outer
+# :local variables, so everything it needs is passed in explicitly.
+:local pushRecord do={
+  :do {
+    :local updateResult [/tool fetch \
+      url="https://api.cloudflare.com/client/v4/zones/$zone/dns_records/$record" \
+      http-method=patch \
+      http-header-field="Content-Type: application/json,Authorization: Bearer $token" \
+      http-data="{\"content\":\"$ip\",\"comment\":\"$comment\"}" \
+      check-certificate=yes-without-crl \
+      output=user as-value]
+    :local respBody ($updateResult->"data")
+    :if ([:find $respBody "\"success\":true"] != nil) do={
+      :log info ("cf-push-ip: " . $label . " record updated successfully -> " . $ip)
+    } else={
+      :log error ("cf-push-ip: " . $label . " update failed, response: " . $respBody)
+    }
+  } on-error={
+    :log error ("cf-push-ip: HTTP request to Cloudflare API failed for " . $label . " record")
+  }
 }
 
 :local attempt 0
@@ -61,7 +97,26 @@
   }
 }
 
-:log info "cf-push-ip: internet is up, public IP is $publicIp (after $attempt attempt(s))"
+:log info "cf-push-ip: internet is up, public IPv4 is $publicIp (after $attempt attempt(s))"
+
+# Fetch the public IPv6 once, over a v6-only host so the address family is
+# unambiguous. Best-effort only: a failure here means IPv6 egress is not
+# working, in which case publishing an AAAA record would point the subdomain
+# at an unreachable address, so we skip it rather than block the A update.
+:local publicIp6 ""
+:if ($doIpv6 = true) do={
+  :do {
+    :local ip6Result [/tool fetch url=$ipCheckUrl6 check-certificate=yes-without-crl output=user as-value]
+    :if (($ip6Result->"status") = "finished") do={
+      :set publicIp6 ($ip6Result->"data")
+    }
+  } on-error={}
+  :if ($publicIp6 = "") do={
+    :log warning "cf-push-ip: no IPv6 connectivity, AAAA record left unchanged"
+  } else={
+    :log info "cf-push-ip: public IPv6 is $publicIp6"
+  }
+}
 
 # Wait for the clock to be NTP-synced before trusting it for the timestamp.
 # Best-effort only: if it never syncs, we still proceed rather than blocking
@@ -86,20 +141,9 @@
 :local cfComment ($commentName . " - " . $timestamp)
 
 :log info "cf-push-ip: updating Cloudflare (comment: $cfComment)"
-:do {
-  :local updateResult [/tool fetch \
-    url="https://api.cloudflare.com/client/v4/zones/$cfZoneId/dns_records/$cfRecordId" \
-    http-method=patch \
-    http-header-field="Content-Type: application/json,Authorization: Bearer $cfApiToken" \
-    http-data="{\"content\":\"$publicIp\",\"comment\":\"$cfComment\"}" \
-    check-certificate=yes-without-crl \
-    output=user as-value]
-  :local respBody ($updateResult->"data")
-  :if ([:find $respBody "\"success\":true"] != nil) do={
-    :log info "cf-push-ip: Cloudflare record updated successfully"
-  } else={
-    :log error ("cf-push-ip: Cloudflare update failed, response: " . $respBody)
-  }
-} on-error={
-  :log error "cf-push-ip: HTTP request to Cloudflare API failed"
+
+$pushRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId ip=$publicIp comment=$cfComment label="A"
+
+:if ($publicIp6 != "") do={
+  $pushRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId6 ip=$publicIp6 comment=$cfComment label="AAAA"
 }
