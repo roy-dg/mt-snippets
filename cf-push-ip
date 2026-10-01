@@ -12,9 +12,12 @@
 #           cfpuship-recordid, and optionally cfpuship-recordid6
 #           for the AAAA record. Seed them from the terminal with
 #           $SECRET "set" "<name>" password="..."
-# Policy: read, test, sensitive
+# Policy: read, test, sensitive, policy
 #         "sensitive" is required to read the vault: policy is
 #         enforced per the running script, not per secret-vault.
+#         "policy" is for running secret-vault below; drop it if
+#         your RouterOS version lets /system script run work with
+#         read alone. Requires a script named exactly "secret-vault".
 # ============================================================
 
 # ---- Configurable variables ----
@@ -39,11 +42,21 @@
 # At startup this script and secret-vault's own scheduler entry race, so
 # waiting for $SECRET to exist is required, not cosmetic. $SECRET lives in
 # the script environment and is cleared by a reboot; the secrets themselves
-# persist in /ppp/secret. vaultMaxWait is in 500ms units, so 60 = 30s - the
-# startup delay above does not guarantee secret-vault has run yet, only that
-# it has had a chance to.
+# persist in /ppp/secret. vaultMaxWait is in 500ms units, so 60 = 30s.
 :global SecretVaultReady
 :global SECRET
+
+# If the vault isn't up yet, define it ourselves rather than hoping its own
+# scheduler entry has already fired. A no-op when it is up, so this is safe
+# to do unconditionally-ish, and it turns the startup ordering from probable
+# into deterministic. The wait loop below is kept as a fallback, for the case
+# where secret-vault is already mid-execution from its own entry.
+:if ($SecretVaultReady != true) do={
+  :do { /system script run secret-vault } on-error={
+    :log warning "cf-push-ip: could not run secret-vault directly, falling back to waiting for it"
+  }
+}
+
 :local waited 0
 :while ($SecretVaultReady != true && $waited < $vaultMaxWait) do={
   :delay 500ms
