@@ -1,10 +1,10 @@
 # ============================================================
 # IPv6-only variant of cf-push-ip: pushes this instance's public
 # IPv6 plus a timestamped comment to a Cloudflare AAAA record.
-# Runs at startup, retrying every 30s until IPv6 egress is up -
-# here IPv6 is the point, not best-effort. Run this *instead of*
-# cf-push-ip; running both makes two scripts fight over the AAAA
-# record.
+# Runs at startup, waiting for a usable address and then retrying
+# the update every 30s until it lands - here IPv6 is the point,
+# not best-effort. Run this *instead of* cf-push-ip; running both
+# makes two scripts fight over the same AAAA record.
 # Requires: /system clock set time-zone-name=Asia/Hong_Kong format=yyyy-MM-dd
 # Requires: secret-vault (defines $SECRET) with cfpuship-apitoken,
 #           cfpuship-zoneid and cfpuship-recordid6. The first two
@@ -12,18 +12,27 @@
 #           $SECRET "set" "<name>" password="..."
 # Policy: read, test, sensitive, policy
 #         "sensitive" reads the vault; "policy" runs secret-vault.
-# Endpoint: ipv6.icanhazip.com is AAAA-only, so the answer cannot
-#         arrive over IPv4, and Cloudflare-fronted, so it is the
-#         same reachability class as api.cloudflare.com -
-#         api6.ipify.org is blocked in China. AAAA-only
-#         alternative: ipv6.ip.sb (api.ip.sb is dual stack).
+# Source of the address: there is no NAT in IPv6, so the global
+#         address on wanInterface *is* the public one. That is read
+#         first - deterministic, instant, and it needs no internet.
+#         ipv6.icanhazip.com is the fallback for hosts where the
+#         public address does not sit on the router. It is AAAA-only
+#         (the answer cannot arrive over IPv4) and Cloudflare-fronted,
+#         so the same reachability class as api.cloudflare.com -
+#         api6.ipify.org is blocked in China. AAAA-only alternative:
+#         ipv6.ip.sb (api.ip.sb is dual stack).
+#         An address ending in :: is the subnet-router anycast
+#         address, not a host - it is refused rather than published.
+#         Fix it with: /ipv6 address set [find from-pool=<pool>] address=::1/64
 # ============================================================
 
 # ---- Configurable variables ----
 :local commentName   "<Name>"
+:local wanInterface  "pppoe-out1"
 :local ipCheckUrl6   "https://ipv6.icanhazip.com"
 :local retryDelay       30s
 :local logEveryAttempts 10
+:local pushMaxAttempts  20
 :local clockMaxAttempts 6
 :local clockRetryDelay  5s
 :local vaultMaxWait     60
@@ -89,7 +98,27 @@
   :return $out
 }
 
-# PATCH one DNS record. do={} functions see no outer :local, so pass it all in.
+# The global address on the WAN interface, or "" if it has none yet. Skips
+# link-local (fe80::) and ULA (fc00::/7), neither of which is routable.
+:local readWanIp6 do={
+  :local found ""
+  :foreach a in=[/ipv6 address find interface=$iface] do={
+    :if ($found = "") do={
+      :local raw [/ipv6 address get $a address]
+      :local slash [:find $raw "/"]
+      :if ($slash != nil) do={ :set raw [:pick $raw 0 $slash] }
+      :local head [:pick $raw 0 2]
+      :if ([/ipv6 address get $a disabled] != true && [/ipv6 address get $a invalid] != true && \
+           $head != "fe" && $head != "fc" && $head != "fd") do={
+        :set found $raw
+      }
+    }
+  }
+  :return $found
+}
+
+# PATCH one DNS record, returning whether it worked. do={} functions see no
+# outer :local, so pass it all in.
 :local pushRecord do={
   :do {
     :local updateResult [/tool fetch \
@@ -102,40 +131,59 @@
     :local respBody ($updateResult->"data")
     :if ([:find $respBody "\"success\":true"] != nil) do={
       :log info ("cf-push-ip6: " . $label . " record updated successfully -> " . $ip)
-    } else={
-      :log error ("cf-push-ip6: " . $label . " update failed, response: " . $respBody)
+      :return true
     }
+    :log error ("cf-push-ip6: " . $label . " update failed, response: " . $respBody)
   } on-error={
     :log error ("cf-push-ip6: HTTP request to Cloudflare API failed for " . $label . " record")
   }
+  :return false
 }
 
 :local attempt 0
 :local sinceLastLog 0
 :local publicIp6 ""
+:local unusableLogged false
 
-:log info "cf-push-ip6: waiting for IPv6 connectivity"
+:log info "cf-push-ip6: waiting for a usable public IPv6"
 
 :while ($publicIp6 = "") do={
   :set attempt ($attempt + 1)
-  :do {
-    :local ip6Result [/tool fetch url=$ipCheckUrl6 check-certificate=yes-without-crl output=user as-value]
-    :if (($ip6Result->"status") = "finished") do={
-      :set publicIp6 [$trimIp raw=($ip6Result->"data")]
+  :do { :set publicIp6 [$readWanIp6 iface=$wanInterface] } on-error={
+    :log warning ("cf-push-ip6: could not read an address from " . $wanInterface . ", falling back to " . $ipCheckUrl6)
+  }
+
+  # Only reach out if the router has no global address of its own.
+  :if ($publicIp6 = "") do={
+    :do {
+      :local ip6Result [/tool fetch url=$ipCheckUrl6 check-certificate=yes-without-crl output=user as-value]
+      :if (($ip6Result->"status") = "finished") do={
+        :set publicIp6 [$trimIp raw=($ip6Result->"data")]
+      }
+    } on-error={}
+  }
+
+  # ...:: is the subnet-router anycast address of the /64, not a host, so
+  # peers cannot reach it. Discard it and keep waiting for a real address.
+  :if ([:len $publicIp6] > 1 && [:pick $publicIp6 ([:len $publicIp6] - 2) [:len $publicIp6]] = "::") do={
+    :if ($unusableLogged = false) do={
+      :log error ("cf-push-ip6: " . $publicIp6 . " is a subnet-router anycast address, not a host - fix the suffix, e.g. /ipv6 address set [find from-pool=<pool>] address=::1/64")
+      :set unusableLogged true
     }
-  } on-error={}
+    :set publicIp6 ""
+  }
 
   :if ($publicIp6 = "") do={
     :set sinceLastLog ($sinceLastLog + 1)
     :if ($sinceLastLog >= $logEveryAttempts) do={
-      :log warning "cf-push-ip6: still no IPv6 connectivity after $attempt attempts, retrying every $retryDelay"
+      :log warning "cf-push-ip6: still no usable public IPv6 after $attempt attempts, retrying every $retryDelay"
       :set sinceLastLog 0
     }
     :delay $retryDelay
   }
 }
 
-:log info "cf-push-ip6: IPv6 is up, public IPv6 is $publicIp6 (after $attempt attempt(s))"
+:log info "cf-push-ip6: public IPv6 is $publicIp6 (after $attempt attempt(s))"
 
 # Best-effort: if the clock never syncs we still proceed rather than block
 # the IP update over a cosmetic timestamp.
@@ -160,4 +208,18 @@
 
 :log info "cf-push-ip6: updating Cloudflare (comment: $cfComment)"
 
-$pushRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId6 ip=$publicIp6 comment=$cfComment label="AAAA"
+# Having an address is not proof that egress works yet - at startup the PD
+# arrives before the path is usable - so the push itself is what retries.
+# Bounded, unlike the address loop: a bad token would otherwise retry forever.
+:local pushed false
+:set attempt 0
+:while ($pushed = false && $attempt < $pushMaxAttempts) do={
+  :set attempt ($attempt + 1)
+  :set pushed [$pushRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId6 \
+               ip=$publicIp6 comment=$cfComment label="AAAA"]
+  :if ($pushed = false) do={ :delay $retryDelay }
+}
+:if ($pushed = false) do={
+  :log error "cf-push-ip6: giving up after $attempt failed update attempts"
+  :error "cf-push-ip6: update failed"
+}
