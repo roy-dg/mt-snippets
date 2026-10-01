@@ -6,6 +6,8 @@
 #   /system scheduler add name=cf-push-ip6 start-time=startup \
 #     interval=5m policy=read,test,sensitive,policy \
 #     on-event="/system script run cf-push-ip6"
+#   ...or, if the entry already exists, set rather than add:
+#   /system scheduler set [find name=cf-push-ip6] interval=5m
 # The scheduler is the retry mechanism, so a run that finds no
 # usable address does nothing and leaves it to the next one -
 # nothing here loops for longer than the interval.
@@ -30,6 +32,9 @@
 #         An address ending in :: is the subnet-router anycast
 #         address, not a host - it is refused rather than published.
 #         Fix it with: /ipv6 address set [find from-pool=<pool>] address=::1/64
+# State: $cfPushIp6Last holds the last address pushed. Inspect with
+#         /system script environment print; forcing a re-push is
+#         /system script environment remove [find name=cfPushIp6Last]
 # ============================================================
 
 # ---- Configurable variables ----
@@ -38,6 +43,7 @@
 :local ipCheckUrl6   "https://ipv6.icanhazip.com"
 :local retryDelay       5s
 :local pushMaxAttempts  3
+:local quietEvery       12
 :local clockMaxAttempts 6
 :local clockRetryDelay  5s
 :local vaultMaxWait     60
@@ -183,8 +189,9 @@
 
 # ...:: is the subnet-router anycast address of the /64, not a host, so peers
 # cannot reach it. Refuse it rather than publishing an unreachable endpoint.
+:local problem "no usable public IPv6 this run"
 :if ([:len $publicIp6] > 1 && [:pick $publicIp6 ([:len $publicIp6] - 2) [:len $publicIp6]] = "::") do={
-  :log error ("cf-push-ip6: " . $publicIp6 . " is a subnet-router anycast address, not a host - fix the suffix, e.g. /ipv6 address set [find from-pool=<pool>] address=::1/64")
+  :set problem ($publicIp6 . " is a subnet-router anycast address, not a host - fix the suffix, e.g. /ipv6 address set [find from-pool=<pool>] address=::1/64")
   :set publicIp6 ""
 }
 
@@ -192,10 +199,17 @@
 # run. Set only after a successful push, so a failed one is retried next run
 # rather than remembered as done.
 :global cfPushIp6Last
+:global cfPushIp6Quiet
+:if ([:typeof $cfPushIp6Quiet] != "num") do={ :set cfPushIp6Quiet 0 }
 
 :if ($publicIp6 = "") do={
-  :log warning "cf-push-ip6: no usable public IPv6 this run"
+  # A WAN outage would otherwise log 288 times a day, so complain on the
+  # first failing run and hourly after that.
+  :set cfPushIp6Quiet ($cfPushIp6Quiet + 1)
+  :if ($cfPushIp6Quiet >= $quietEvery) do={ :set cfPushIp6Quiet 0 }
+  :if ($cfPushIp6Quiet = 1) do={ :log warning ("cf-push-ip6: " . $problem) }
 } else={
+  :set cfPushIp6Quiet 0
   :local known $cfPushIp6Last
   :if ([:typeof $known] != "str") do={ :set known "" }
   :if ($known = "") do={
