@@ -1,9 +1,21 @@
 # ============================================================
-# Push this instance's public IPv4 (and IPv6, if configured) plus
-# a timestamped comment to Cloudflare A/AAAA records. Runs at
-# startup, retrying every 30s until connectivity is up. IPv4
-# gates startup; IPv6 is skipped if the AAAA secret is absent or
-# IPv6 egress is down. For a v6-only host use cf-push-ip6 instead.
+# Push this instance's current public IPs + a timestamped comment
+# to a Cloudflare A record, and to a AAAA record for the same
+# subdomain if one is configured - but only when an address has
+# actually changed. Meant to run every 5 minutes (plus once at
+# startup):
+#   /system scheduler add name=cf-push-ip start-time=startup \
+#     interval=5m policy=read,test,sensitive,policy \
+#     on-event="/system script run cf-push-ip"
+#   ...or, if the entry already exists, set rather than add:
+#   /system scheduler set [find name=cf-push-ip] interval=5m
+# The scheduler is the retry mechanism, so a run that finds no
+# address does nothing and leaves it to the next one - nothing
+# here loops for longer than the interval.
+# IPv6 is best-effort: it is skipped if the AAAA secret is absent
+# or IPv6 egress is down, and a failure there never blocks the A
+# record. For a v6-only host use cf-push-ip6 instead; running
+# both makes two scripts fight over the same AAAA record.
 # Requires: /system clock set time-zone-name=Asia/Hong_Kong format=yyyy-MM-dd
 # Requires: secret-vault (defines $SECRET) with cfpuship-apitoken,
 #           cfpuship-zoneid, cfpuship-recordid, and optionally
@@ -16,43 +28,51 @@
 #         China. Each host is single-family (no AAAA on ipv4.*, no
 #         A on ipv6.*) so the address family is unambiguous.
 #         AAAA-only alternative: ipv6.ip.sb (api.ip.sb is dual stack).
+#         Unlike cf-push-ip6 this asks the network for its IPv4
+#         rather than reading the WAN interface: under CGNAT the
+#         interface address is not the public one.
+#         An IPv6 ending in :: is the subnet-router anycast address,
+#         not a host - it is refused rather than published. Fix with:
+#         /ipv6 address set [find from-pool=<pool>] address=::1/64
+# State: $cfPushIpLast and $cfPushIp6Last hold the addresses last
+#         pushed. Inspect with /system script environment print;
+#         forcing a re-push is
+#         /system script environment remove [find name=cfPushIpLast]
 # ============================================================
 
 # ---- Configurable variables ----
 :local commentName   "<Name>"
 :local ipCheckUrl       "https://ipv4.icanhazip.com"
 :local ipCheckUrl6      "https://ipv6.icanhazip.com"
-:local retryDelay       30s
-:local logEveryAttempts 10
+:local retryDelay       5s
+:local pushMaxAttempts  3
+:local quietEvery       12
+:local heartbeatEvery   1
 :local clockMaxAttempts 6
 :local clockRetryDelay  5s
 :local vaultMaxWait     60
 :local startupDelay     5s
 # ---------------------------------
 
-# start-time=startup fires before RouterOS is fully up, so pause briefly.
-# A courtesy pause only: the vault is run directly below rather than waited
-# on, and the connectivity loop retries forever.
-:delay $startupDelay
-
-# $SECRET lives in the script environment and is cleared by a reboot; the
-# secrets themselves persist in /ppp/secret. vaultMaxWait is in 500ms units.
 :global SecretVaultReady
 :global SECRET
 
-# Run the vault ourselves rather than hoping its own scheduler entry has
-# already fired - a no-op if it has. The wait loop below is the fallback for
-# when secret-vault is already mid-execution from that entry.
+# Everything in this block is boot-only: $SecretVaultReady is cleared by a
+# reboot and set by secret-vault, so later runs skip straight past it.
+# start-time=startup fires before RouterOS is fully up, hence the pause; the
+# vault is run directly rather than waiting on its own scheduler entry, which
+# would otherwise be a race. The secrets persist in /ppp/secret - only $SECRET
+# itself is per-boot. vaultMaxWait is in 500ms units.
 :if ($SecretVaultReady != true) do={
+  :delay $startupDelay
   :do { /system script run secret-vault } on-error={
     :log warning "cf-push-ip: could not run secret-vault directly, falling back to waiting for it"
   }
-}
-
-:local waited 0
-:while ($SecretVaultReady != true && $waited < $vaultMaxWait) do={
-  :delay 500ms
-  :set waited ($waited + 1)
+  :local waited 0
+  :while ($SecretVaultReady != true && $waited < $vaultMaxWait) do={
+    :delay 500ms
+    :set waited ($waited + 1)
+  }
 }
 :if ($SecretVaultReady != true) do={
   :log error "cf-push-ip: secret-vault not ready, cannot read credentials - aborting"
@@ -80,13 +100,8 @@
 # Optional: without it this stays a pure IPv4 updater.
 :local cfRecordId6 ""
 :do { :set cfRecordId6 [$SECRET "get" "cfpuship-recordid6"] } on-error={}
-:local doIpv6 true
-:if ($cfRecordId6 = "") do={
-  :set doIpv6 false
-  :log info "cf-push-ip: no cfpuship-recordid6 secret, IPv6 record will not be updated"
-}
 
-# The endpoint returns the address with a trailing newline, which would end
+# The endpoints return the address with a trailing newline, which would end
 # up inside the JSON body and be rejected, so strip anything non-address.
 :local trimIp do={
   :local out ""
@@ -97,7 +112,39 @@
   :return $out
 }
 
-# PATCH one DNS record. do={} functions see no outer :local, so pass it all in.
+# One attempt, no retry loop: the next run is only 5 minutes away, and
+# looping here would stack up overlapping runs. "" means "not available".
+:local fetchIp do={
+  :do {
+    :local res [/tool fetch url=$url check-certificate=yes-without-crl output=user as-value]
+    :if (($res->"status") = "finished") do={ :return ($res->"data") }
+  } on-error={}
+  :return ""
+}
+
+# What a DNS record currently holds, or "" if it cannot be read. Only used on
+# the first run after a reboot, to avoid a pointless push across one.
+:local readRecord do={
+  :do {
+    :local res [/tool fetch \
+      url="https://api.cloudflare.com/client/v4/zones/$zone/dns_records/$record" \
+      http-header-field="Authorization: Bearer $token" \
+      check-certificate=yes-without-crl \
+      output=user as-value]
+    :local body ($res->"data")
+    :local key "\"content\":\""
+    :local start [:find $body $key]
+    :if ($start != nil) do={
+      :set start ($start + [:len $key])
+      :local end [:find $body "\"" $start]
+      :if ($end != nil) do={ :return [:pick $body $start $end] }
+    }
+  } on-error={}
+  :return ""
+}
+
+# PATCH one DNS record, returning whether it worked. do={} functions see no
+# outer :local, so pass it all in.
 :local pushRecord do={
   :do {
     :local updateResult [/tool fetch \
@@ -110,83 +157,133 @@
     :local respBody ($updateResult->"data")
     :if ([:find $respBody "\"success\":true"] != nil) do={
       :log info ("cf-push-ip: " . $label . " record updated successfully -> " . $ip)
-    } else={
-      :log error ("cf-push-ip: " . $label . " update failed, response: " . $respBody)
+      :return true
     }
+    :log error ("cf-push-ip: " . $label . " update failed, response: " . $respBody)
   } on-error={
     :log error ("cf-push-ip: HTTP request to Cloudflare API failed for " . $label . " record")
   }
+  :return false
 }
 
-:local attempt 0
-:local sinceLastLog 0
-:local publicIp ""
-
-:log info "cf-push-ip: waiting for internet connectivity"
-
-:while ($publicIp = "") do={
-  :set attempt ($attempt + 1)
-  :do {
-    :local ipResult [/tool fetch url=$ipCheckUrl check-certificate=yes-without-crl output=user as-value]
-    :if (($ipResult->"status") = "finished") do={
-      :set publicIp [$trimIp raw=($ipResult->"data")]
-    }
-  } on-error={}
-
-  :if ($publicIp = "") do={
-    :set sinceLastLog ($sinceLastLog + 1)
-    :if ($sinceLastLog >= $logEveryAttempts) do={
-      :log warning "cf-push-ip: still no internet connectivity after $attempt attempts, retrying every $retryDelay"
-      :set sinceLastLog 0
-    }
-    :delay $retryDelay
-  }
-}
-
-:log info "cf-push-ip: internet is up, public IPv4 is $publicIp (after $attempt attempt(s))"
-
-# Best-effort: no IPv6 egress means an AAAA record would point at an
-# unreachable address, so skip it rather than block the A update.
+:local publicIp  [$trimIp raw=[$fetchIp url=$ipCheckUrl]]
 :local publicIp6 ""
-:if ($doIpv6 = true) do={
-  :do {
-    :local ip6Result [/tool fetch url=$ipCheckUrl6 check-certificate=yes-without-crl output=user as-value]
-    :if (($ip6Result->"status") = "finished") do={
-      :set publicIp6 [$trimIp raw=($ip6Result->"data")]
+:if ($cfRecordId6 != "") do={
+  :set publicIp6 [$trimIp raw=[$fetchIp url=$ipCheckUrl6]]
+}
+
+# ...:: is the subnet-router anycast address of the /64, not a host, so peers
+# cannot reach it. Refuse it rather than publishing an unreachable endpoint.
+:if ([:len $publicIp6] > 1 && [:pick $publicIp6 ([:len $publicIp6] - 2) [:len $publicIp6]] = "::") do={
+  :log error ("cf-push-ip: " . $publicIp6 . " is a subnet-router anycast address, not a host - fix the suffix, e.g. /ipv6 address set [find from-pool=<pool>] address=::1/64")
+  :set publicIp6 ""
+}
+
+# Surviving the reboot that clears these costs one GET per boot, not one per
+# run. Set only after a successful push, so a failed one is retried next run
+# rather than remembered as done.
+:global cfPushIpLast
+:global cfPushIp6Last
+:global cfPushIpQuiet
+:global cfPushIpRuns
+:if ([:typeof $cfPushIpQuiet] != "num") do={ :set cfPushIpQuiet 0 }
+:if ([:typeof $cfPushIpRuns]  != "num") do={ :set cfPushIpRuns 0 }
+
+:local knownIp $cfPushIpLast
+:if ([:typeof $knownIp] != "str") do={ :set knownIp "" }
+:if ($knownIp = "" && $publicIp != "") do={
+  :set knownIp [$readRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId]
+}
+:local knownIp6 $cfPushIp6Last
+:if ([:typeof $knownIp6] != "str") do={ :set knownIp6 "" }
+:if ($knownIp6 = "" && $publicIp6 != "") do={
+  :set knownIp6 [$readRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId6]
+}
+
+:local needA    ($publicIp  != "" && $publicIp  != $knownIp)
+:local needAAAA ($publicIp6 != "" && $publicIp6 != $knownIp6)
+
+# IPv4 is what this script is for, so its absence is worth complaining about -
+# but at one run every 5 minutes an outage would log 288 times a day, so warn
+# on the first failing run and hourly after that.
+:if ($publicIp = "") do={
+  :set cfPushIpQuiet ($cfPushIpQuiet + 1)
+  :if ($cfPushIpQuiet = 1) do={ :log warning "cf-push-ip: no internet connectivity this run" }
+  :if ($cfPushIpQuiet >= $quietEvery) do={ :set cfPushIpQuiet 0 }
+} else={
+  :set cfPushIpQuiet 0
+}
+
+:if ($needA = false && $needAAAA = false) do={
+  # Nothing to do, but say so - or a working script and a dead one look
+  # identical in the log. Every run by default; raise heartbeatEvery to log
+  # one run in N instead (12 = hourly at a 5m interval).
+  :if ($publicIp != "") do={
+    :set cfPushIpRuns ($cfPushIpRuns + 1)
+    :if ($cfPushIpRuns = 1) do={
+      :local both $publicIp
+      :if ($publicIp6 != "") do={ :set both ($both . " / " . $publicIp6) }
+      :log info ("cf-push-ip: " . $both . " unchanged, no update")
     }
-  } on-error={}
-  :if ($publicIp6 = "") do={
-    :log warning "cf-push-ip: no IPv6 connectivity, AAAA record left unchanged"
-  } else={
-    :log info "cf-push-ip: public IPv6 is $publicIp6"
+    :if ($cfPushIpRuns >= $heartbeatEvery) do={ :set cfPushIpRuns 0 }
   }
-}
+} else={
+  :set cfPushIpRuns 0
 
-# Best-effort: if the clock never syncs we still proceed rather than block
-# the IP update over a cosmetic timestamp.
-:local clockAttempt 0
-:local clockOk false
-:while ($clockAttempt < $clockMaxAttempts and $clockOk = false) do={
-  :set clockAttempt ($clockAttempt + 1)
-  :if ([:tonum [:pick [/system clock get date] 0 4]] >= 2024) do={
-    :set clockOk true
-  } else={
-    :delay $clockRetryDelay
+  # Only now is the timestamp worth waiting for: the comment records when an
+  # address last changed, and a skipped run writes no comment at all.
+  :local clockAttempt 0
+  :local clockOk false
+  :while ($clockAttempt < $clockMaxAttempts and $clockOk = false) do={
+    :set clockAttempt ($clockAttempt + 1)
+    :if ([:tonum [:pick [/system clock get date] 0 4]] >= 2024) do={
+      :set clockOk true
+    } else={
+      :delay $clockRetryDelay
+    }
   }
-}
-:if ($clockOk = false) do={
-  :log warning "cf-push-ip: clock still not synced, comment timestamp may be inaccurate"
-}
+  :if ($clockOk = false) do={
+    :log warning "cf-push-ip: clock still not synced, comment timestamp may be inaccurate"
+  }
 
-:local todayDate [/system clock get date]
-:local nowTime   [/system clock get time]
-:local timestamp ([:pick $todayDate 2 4] . "-" . [:pick $todayDate 5 7] . "-" . [:pick $todayDate 8 10] . " " . [:pick $nowTime 0 5])
-:local cfComment ($commentName . " - " . $timestamp)
+  :local todayDate [/system clock get date]
+  :local nowTime   [/system clock get time]
+  :local timestamp ([:pick $todayDate 2 4] . "-" . [:pick $todayDate 5 7] . "-" . [:pick $todayDate 8 10] . " " . [:pick $nowTime 0 5])
+  :local cfComment ($commentName . " - " . $timestamp)
 
-:log info "cf-push-ip: updating Cloudflare (comment: $cfComment)"
+  # Having an address is not proof that egress works, so each push retries -
+  # but only briefly, so the run finishes well inside the 5m interval.
+  :if ($needA = true) do={
+    :log info ("cf-push-ip: IPv4 changed to " . $publicIp . ", updating Cloudflare (comment: $cfComment)")
+    :local pushed false
+    :local attempt 0
+    :while ($pushed = false && $attempt < $pushMaxAttempts) do={
+      :set attempt ($attempt + 1)
+      :set pushed [$pushRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId \
+                   ip=$publicIp comment=$cfComment label="A"]
+      :if ($pushed = false && $attempt < $pushMaxAttempts) do={ :delay $retryDelay }
+    }
+    :if ($pushed = true) do={
+      :set cfPushIpLast $publicIp
+    } else={
+      :log error "cf-push-ip: giving up on the A record after $attempt attempts, will retry next run"
+    }
+  }
 
-$pushRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId ip=$publicIp comment=$cfComment label="A"
-
-:if ($publicIp6 != "") do={
-  $pushRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId6 ip=$publicIp6 comment=$cfComment label="AAAA"
+  :if ($needAAAA = true) do={
+    :log info ("cf-push-ip: IPv6 changed to " . $publicIp6 . ", updating Cloudflare (comment: $cfComment)")
+    :local pushed6 false
+    :local attempt6 0
+    :while ($pushed6 = false && $attempt6 < $pushMaxAttempts) do={
+      :set attempt6 ($attempt6 + 1)
+      :set pushed6 [$pushRecord token=$cfApiToken zone=$cfZoneId record=$cfRecordId6 \
+                    ip=$publicIp6 comment=$cfComment label="AAAA"]
+      :if ($pushed6 = false && $attempt6 < $pushMaxAttempts) do={ :delay $retryDelay }
+    }
+    :if ($pushed6 = true) do={
+      :set cfPushIp6Last $publicIp6
+    } else={
+      :log error "cf-push-ip: giving up on the AAAA record after $attempt6 attempts, will retry next run"
+    }
+  }
 }
