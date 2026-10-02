@@ -166,10 +166,14 @@
   :return false
 }
 
-:local publicIp  [$trimIp raw=[$fetchIp url=$ipCheckUrl]]
+# Split rather than nested: a function call inside a named argument is the
+# one construct here with no precedent elsewhere in these scripts.
+:local rawIp [$fetchIp url=$ipCheckUrl]
+:local publicIp [$trimIp raw=$rawIp]
 :local publicIp6 ""
 :if ($cfRecordId6 != "") do={
-  :set publicIp6 [$trimIp raw=[$fetchIp url=$ipCheckUrl6]]
+  :local rawIp6 [$fetchIp url=$ipCheckUrl6]
+  :set publicIp6 [$trimIp raw=$rawIp6]
 }
 
 # ...:: is the subnet-router anycast address of the /64, not a host, so peers
@@ -214,7 +218,7 @@
   :set cfPushIpQuiet 0
 }
 
-:if ($needA = false && $needAAAA = false) do={
+:if (!$needA && !$needAAAA) do={
   # Nothing to do, but say so - or a working script and a dead one look
   # identical in the log. Every run by default; raise heartbeatEvery to log
   # one run in N instead (12 = hourly at a 5m interval).
@@ -223,6 +227,7 @@
     :if ($cfPushIpRuns = 1) do={
       :local both $publicIp
       :if ($publicIp6 != "") do={ :set both ($both . " / " . $publicIp6) }
+      :if ($cfRecordId6 != "" && $publicIp6 = "") do={ :set both ($both . " / no IPv6") }
       :log info ("cf-push-ip: " . $both . " unchanged, no update")
     }
     :if ($cfPushIpRuns >= $heartbeatEvery) do={ :set cfPushIpRuns 0 }
@@ -253,7 +258,7 @@
 
   # Having an address is not proof that egress works, so each push retries -
   # but only briefly, so the run finishes well inside the 5m interval.
-  :if ($needA = true) do={
+  :if ($needA) do={
     :log info ("cf-push-ip: IPv4 changed to " . $publicIp . ", updating Cloudflare (comment: $cfComment)")
     :local pushed false
     :local attempt 0
@@ -270,7 +275,7 @@
     }
   }
 
-  :if ($needAAAA = true) do={
+  :if ($needAAAA) do={
     :log info ("cf-push-ip: IPv6 changed to " . $publicIp6 . ", updating Cloudflare (comment: $cfComment)")
     :local pushed6 false
     :local attempt6 0
